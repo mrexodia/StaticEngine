@@ -1,0 +1,10 @@
+Debug/
+Release/
+*.suo
+*.sdf
+*.opensdf
+*.orig
+*.vcxproj.user
+docs/
+.vs/
+*.VC.db
