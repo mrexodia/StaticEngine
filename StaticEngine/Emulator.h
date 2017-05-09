@@ -1,4 +1,20 @@
 #include "TitanEngine.h"
+#include <Psapi.h>
+#include <TlHelp32.h>
+#include <unordered_map>
+#include "ntdll.h"
+
+#pragma comment(lib, "psapi.lib")
+
+//https://www.codeproject.com/Questions/78801/How-to-get-the-main-thread-ID-of-a-process-known-b
+
+#ifndef MAKEULONGLONG
+#define MAKEULONGLONG(ldw, hdw) ((ULONGLONG(hdw) << 32) | ((ldw) & 0xFFFFFFFF))
+#endif
+
+#ifndef MAXULONGLONG
+#define MAXULONGLONG ((ULONGLONG)~((ULONGLONG)0))
+#endif
 
 class Emulator
 {
@@ -19,16 +35,182 @@ public:
 
     bool StopDebug()
     {
-        //TODO
-        return false;
+        SetEvent(hEvent);
+        return true;
+    }
+
+    static std::vector<HMODULE> enumModules(HANDLE hProcess)
+    {
+        std::vector<HMODULE> result;
+        DWORD cbNeeded = 0;
+        if(EnumProcessModules(hProcess, nullptr, 0, &cbNeeded))
+        {
+            result.resize(cbNeeded / sizeof(HMODULE));
+            if(!EnumProcessModules(hProcess, result.data(), cbNeeded, &cbNeeded))
+                result.clear();
+        }
+        return result;
+    }
+
+    static std::wstring getModuleName(HANDLE hProcess, HMODULE hModule)
+    {
+        wchar_t szFileName[MAX_PATH] = L"";
+        if(!GetModuleFileNameExW(hProcess, hModule, szFileName, _countof(szFileName)))
+            *szFileName = L'\0';
+        return szFileName;
+    }
+
+    static MODULEINFO getModuleInfo(HANDLE hProcess, HMODULE hModule)
+    {
+        MODULEINFO info;
+        if(!GetModuleInformation(hProcess, hModule, &info, sizeof(MODULEINFO)))
+            memset(&info, 0, sizeof(info));
+        return info;
+    }
+
+    void getThreadList(DWORD dwProcessId)
+    {
+        //https://blogs.msdn.microsoft.com/oldnewthing/20060223-14/?p=32173
+        HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if(h != INVALID_HANDLE_VALUE)
+        {
+            THREADENTRY32 te;
+            te.dwSize = sizeof(te);
+            ULONGLONG ullMinCreateTime = MAXULONGLONG;
+            dwMainThreadId = 0;
+            if(Thread32First(h, &te))
+            {
+                do
+                {
+                    if(te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(te.th32OwnerProcessID) && te.th32OwnerProcessID == dwProcessId)
+                    {
+                        auto hThread = TitanOpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                        mThreadList[te.th32ThreadID] = hThread;
+                        FILETIME afTimes[4] = { 0 };
+                        if(GetThreadTimes(hThread, &afTimes[0], &afTimes[1], &afTimes[2], &afTimes[3]))
+                        {
+                            ULONGLONG ullTest = MAKEULONGLONG(afTimes[0].dwLowDateTime, afTimes[0].dwHighDateTime);
+                            if(ullTest && ullTest < ullMinCreateTime)
+                            {
+                                ullMinCreateTime = ullTest;
+                                dwMainThreadId = te.th32ThreadID;
+                            }
+                        }
+                        else if(!dwMainThreadId)
+                            dwMainThreadId = te.th32ThreadID;
+                    }
+                    te.dwSize = sizeof(te);
+                } while(Thread32Next(h, &te));
+            }
+            CloseHandle(h);
+        }
+    }
+
+    DWORD dwMainThreadId;
+    std::unordered_map<DWORD, HANDLE> mThreadList;
+    bool mIsDebugging = false;
+    PVOID mEntryPoint;
+    HANDLE hEvent;
+
+    bool cleanup(bool result)
+    {
+        if(mProcessInfo.hProcess)
+            CloseHandle(mProcessInfo.hProcess);
+        if(mProcessInfo.hThread)
+            CloseHandle(mProcessInfo.hThread);
+        for(auto it : mThreadList)
+            CloseHandle(it.second);
+        mThreadList.clear();
+        mIsDebugging = false;
+        return result;
     }
 
     bool AttachDebugger(DWORD ProcessId, bool KillOnExit, LPVOID DebugInfo, LPVOID CallBack)
     {
+        //initialization + open process
         mCbATTACHBREAKPOINT = STEPCALLBACK(CallBack);
         mAttachProcessInfo = (PROCESS_INFORMATION*)DebugInfo;
-        //TODO
-        return false;
+        memset(&mProcessInfo, 0, sizeof(PROCESS_INFORMATION));
+        mProcessInfo.dwProcessId = ProcessId;
+        mProcessInfo.hProcess = TitanOpenProcess(PROCESS_ALL_ACCESS, FALSE, ProcessId);
+        if(!mProcessInfo.hProcess)
+            return cleanup(false);
+
+        //get threads
+        getThreadList(mProcessInfo.dwProcessId);
+        if(!mThreadList.count(dwMainThreadId))
+            return cleanup(false);
+        mProcessInfo.dwThreadId = dwMainThreadId;
+        mProcessInfo.hThread = mThreadList[dwMainThreadId];
+        *mAttachProcessInfo = mProcessInfo;
+        
+        //create process
+        CREATE_PROCESS_DEBUG_INFO createProcess;
+        memset(&createProcess, 0, sizeof(CREATE_PROCESS_DEBUG_INFO));
+        auto mods = enumModules(mProcessInfo.hProcess);
+        if(mods.empty())
+            return cleanup(false);
+        auto mainMod = mods[0]; //undocumented might not be always true
+        auto mainName = getModuleName(mProcessInfo.hProcess, mainMod);
+        auto mainInfo = getModuleInfo(mProcessInfo.hProcess, mainMod);
+        if(!mainInfo.lpBaseOfDll || mainName.empty())
+            return cleanup(false);
+        mIsDebugging = true;
+        createProcess.hFile = CreateFileW(mainName.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        createProcess.hProcess = mProcessInfo.hProcess;
+        createProcess.hThread = mProcessInfo.hThread;
+        createProcess.lpBaseOfImage = mainMod;
+        createProcess.lpStartAddress = LPTHREAD_START_ROUTINE(mEntryPoint = mainInfo.EntryPoint);
+        createProcess.lpThreadLocalBase = GetTEBLocation(createProcess.hThread);
+        mCbCREATEPROCESS(&createProcess);
+        CloseHandle(createProcess.hFile);
+
+        memset(&mDebugEvent, 0, sizeof(DEBUG_EVENT));
+        mDebugEvent.dwProcessId = mProcessInfo.dwProcessId;
+        mDebugEvent.dwThreadId = mProcessInfo.dwThreadId;
+
+        //load modules
+        for(size_t i = 1; i < mods.size(); i++)
+        {
+            LOAD_DLL_DEBUG_INFO loadDll;
+            memset(&loadDll, 0, sizeof(LOAD_DLL_DEBUG_INFO));
+            loadDll.lpBaseOfDll = mods[i];
+            auto dllName = getModuleName(mProcessInfo.hProcess, mods[i]);
+            if(!dllName.empty())
+                loadDll.hFile = CreateFileW(dllName.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            mCbLOADDLL(&loadDll);
+            if(!dllName.empty())
+                CloseHandle(loadDll.hFile);
+        }
+        
+        //create threads
+        for(auto it : mThreadList)
+        {
+            if(it.first == dwMainThreadId)
+                continue;
+            CREATE_THREAD_DEBUG_INFO createThread;
+            memset(&createThread, 0, sizeof(CREATE_THREAD_DEBUG_INFO));
+            createThread.hThread = it.second;
+            ULONG len = sizeof(PVOID);
+            if(NtQueryInformationThread(createThread.hThread, ThreadQuerySetWin32StartAddress, &createThread.lpStartAddress, len, &len))
+                createThread.lpStartAddress = nullptr;
+            createThread.lpThreadLocalBase = GetTEBLocation(createThread.hThread);
+            mCbCREATETHREAD(&createThread);
+        }
+
+        //create the event that gets trigged in StopDebug
+        hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+        //attach breakpoint
+        mCbATTACHBREAKPOINT();
+        
+        //system breakpoint
+        mCbSYSTEMBREAKPOINT(nullptr);
+
+        //return after stop/detach is called
+        WaitForSingleObject(hEvent, INFINITE);
+        CloseHandle(hEvent);
+        return cleanup(true);
     }
 
     bool DetachDebuggerEx(DWORD ProcessId)
@@ -80,14 +262,14 @@ public:
 
     bool IsFileBeingDebugged() const
     {
-        //TODO
-        return false;
+        return mIsDebugging;
     }
+
+    DEBUG_EVENT mDebugEvent;
 
     DEBUG_EVENT* GetDebugData()
     {
-        //TODO
-        return nullptr;
+        return &mDebugEvent;
     }
 
     void SetCustomHandler(DWORD ExceptionId, PVOID CallBack)
@@ -131,13 +313,13 @@ public:
 
     void SetEngineVariable(DWORD VariableId, bool VariableSet)
     {
-        //TODO
+        if(VariableId == UE_ENGINE_SET_DEBUG_PRIVILEGE)
+            mSetDebugPrivilege = VariableSet;
     }
 
     PROCESS_INFORMATION* TitanGetProcessInformation()
     {
-        //TODO
-        return nullptr;
+        return &mProcessInfo;
     }
 
     STARTUPINFOW* TitanGetStartupInformation()
@@ -149,14 +331,44 @@ public:
     //Misc
     void* GetPEBLocation(HANDLE hProcess)
     {
-        //TODO
-        return nullptr;
+        ULONG RequiredLen = 0;
+        void* PebAddress = 0;
+        PROCESS_BASIC_INFORMATION myProcessBasicInformation[5] = { 0 };
+
+        if(NtQueryInformationProcess(hProcess, ProcessBasicInformation, myProcessBasicInformation, sizeof(PROCESS_BASIC_INFORMATION), &RequiredLen) == 0)
+        {
+            PebAddress = (void*)myProcessBasicInformation->PebBaseAddress;
+        }
+        else
+        {
+            if(NtQueryInformationProcess(hProcess, ProcessBasicInformation, myProcessBasicInformation, RequiredLen, &RequiredLen) == 0)
+            {
+                PebAddress = (void*)myProcessBasicInformation->PebBaseAddress;
+            }
+        }
+
+        return PebAddress;
     }
 
-    void* GetTEBLocation(HANDLE hProcess)
+    void* GetTEBLocation(HANDLE hThread)
     {
-        //TODO
-        return nullptr;
+        ULONG RequiredLen = 0;
+        void* TebAddress = 0;
+        THREAD_BASIC_INFORMATION myThreadBasicInformation[5] = { 0 };
+
+        if(NtQueryInformationThread(hThread, ThreadBasicInformation, myThreadBasicInformation, sizeof(THREAD_BASIC_INFORMATION), &RequiredLen) == 0)
+        {
+            TebAddress = (void*)myThreadBasicInformation->TebBaseAddress;
+        }
+        else
+        {
+            if(NtQueryInformationThread(hThread, ThreadBasicInformation, myThreadBasicInformation, RequiredLen, &RequiredLen) == 0)
+            {
+                TebAddress = (void*)myThreadBasicInformation->TebBaseAddress;
+            }
+        }
+
+        return TebAddress;
     }
 
     bool HideDebugger(HANDLE hProcess, DWORD PatchAPILevel)
@@ -165,7 +377,7 @@ public:
         return false;
     }
 
-    HANDLE TitanOpenProces(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwProcessId)
+    HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwProcessId)
     {
         //TODO
         return OpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId);
@@ -173,13 +385,13 @@ public:
 
     HANDLE TitanOpenThread(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwThreadId)
     {
-        //TODO
+        //TODO: debug privilege
         return OpenThread(dwDesiredAccess, bInheritHandle, dwThreadId);
     }
 
     ULONG_PTR ImporterGetRemoteAPIAddress(HANDLE hProcess, ULONG_PTR APIAddress)
     {
-        //TODO
+        //TODO: debug privilege
         return 0;
     }
 
@@ -197,8 +409,15 @@ public:
     //Registers
     ULONG_PTR GetContextDataEx(HANDLE hActiveThread, DWORD IndexOfRegister) const
     {
+        switch(IndexOfRegister)
+        {
+        case UE_EIP:
+        case UE_RIP:
+        case UE_CIP:
+            return ULONG_PTR(mEntryPoint);
+        }
         //TODO
-        return false;
+        return 0;
     }
 
     bool SetContextDataEx(HANDLE hActiveThread, DWORD IndexOfRegister, ULONG_PTR NewRegisterValue)
@@ -210,7 +429,8 @@ public:
     bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext) const
     {
         //TODO
-        return false;
+        titcontext->cip = ULONG_PTR(mEntryPoint);
+        return true;
     }
 
     bool SetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
@@ -380,4 +600,5 @@ private: //variables
     CUSTOMHANDLER mCbDEBUGEVENT = nullptr;
     STEPCALLBACK mCbATTACHBREAKPOINT = nullptr;
     PROCESS_INFORMATION* mAttachProcessInfo = nullptr;
+    PROCESS_INFORMATION mProcessInfo;
 };
