@@ -389,12 +389,6 @@ public:
         return OpenThread(dwDesiredAccess, bInheritHandle, dwThreadId);
     }
 
-    ULONG_PTR ImporterGetRemoteAPIAddress(HANDLE hProcess, ULONG_PTR APIAddress)
-    {
-        //TODO: debug privilege
-        return 0;
-    }
-
     //Stepping
     void StepOver(LPVOID CallBack)
     {
