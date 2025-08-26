@@ -1,4 +1,4 @@
-[![Build status](https://ci.appveyor.com/api/projects/status/60x91o4qcuwp9455?svg=true)](https://ci.appveyor.com/project/mrexodia/staticengine)
+# **Project merged into: https://github.com/x64dbg/GleeBug**
 
 # StaticEngine
 
